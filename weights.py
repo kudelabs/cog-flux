@@ -90,8 +90,8 @@ class WeightsDownloadCache:
 def download_weights(
     url: str,
     path: Path,
-    hf_api_token: str | None = None,
-    civitai_api_token: str | None = None,
+    hf_api_token: Secret | str | None = None,
+    civitai_api_token: Secret | str | None = None,
 ):
     download_url = make_download_url(url, civitai_api_token=civitai_api_token)
     download_weights_url(download_url, path, hf_api_token=hf_api_token)
@@ -118,43 +118,58 @@ def logged_in_to_huggingface(
         print("Logged out of HuggingFace.")
 
 
-def download_weights_url(url: str, path: Path, hf_api_token: str | None = None):
+def download_weights_url(url: str, path: Path, hf_api_token: Secret | str | None = None):
     path = Path(path)
 
     print("Downloading weights")
     start_time = time.time()
 
     if m := re.match(
-        r"^(?:https?://)?huggingface\.co/([^/]+)/([^/]+)(?:/([^/]+\.safetensors))?/?$",
+        r"^(?:https?://)?huggingface\.co/([^/]+)/([^/]+)(?:/resolve/main/|/blob/main/)?(.*)/?$",
         url,
     ):
         if len(m.groups()) == 2:
             owner, model_name = m.groups()
-            lora_weights = None
+            file_path = None
         else:
-            owner, model_name, lora_weights = m.groups()
+            owner, model_name, file_path = m.groups()
+            # 确保文件路径以 .safetensors 结尾
+            if not file_path.endswith('.safetensors'):
+                raise ValueError(
+                    f"HuggingFace URL must point to a .safetensors file. Got: {file_path}"
+                )
+
+        # Convert string token to Secret if needed
+        token_for_login = None
+        if hf_api_token is not None:
+            if isinstance(hf_api_token, str):
+                token_for_login = Secret(hf_api_token)
+            else:
+                token_for_login = hf_api_token
 
         # Use HuggingFace Hub download directly
         try:
-            with logged_in_to_huggingface(hf_api_token):
-                if lora_weights is None:
-                    repo_id = f"{owner}/{model_name}"
+            with logged_in_to_huggingface(token_for_login):
+                repo_id = f"{owner}/{model_name}"
+
+                if file_path is None:
+                    # If no file path specified, find the first .safetensors file
                     files = HfApi().list_repo_files(repo_id)
                     sft_files = [file for file in files if ".safetensors" in file]
                     if len(sft_files) == 1:
-                        lora_weights = sft_files[0]
+                        file_path = sft_files[0]
                     else:
                         raise ValueError(
                             f"No *.safetensors file was explicitly specified from the HuggingFace repo {repo_id} and more than one *.safetensors file was found. Found: {[sft_file for sft_file in sft_files]}"
                         )
 
                 safetensors_path = hf_hub_download(
-                    repo_id=f"{owner}/{model_name}",
-                    filename=lora_weights,
+                    repo_id=repo_id,
+                    filename=file_path,
                 )
                 # Copy the downloaded file to the desired path
                 shutil.copy(Path(safetensors_path), path)
-                print(f"Downloaded {lora_weights} from HuggingFace to {path}")
+                print(f"Downloaded {file_path} from HuggingFace to {path}")
         except Exception as e:
             raise ValueError(f"Failed to download from HuggingFace: {e}")
     elif url.startswith("data:"):
@@ -268,12 +283,17 @@ def make_download_url(url: str, civitai_api_token: Secret | None = None) -> str:
     if url.startswith("data:"):
         return url
     if m := re.match(
-        r"^(?:https?://)?huggingface\.co/([^/]+)/([^/]+)(?:/([^/]+\.safetensors))?/?$",
+        r"^(?:https?://)?huggingface\.co/([^/]+)/([^/]+)(?:/resolve/main/|/blob/main/)?(.*)/?$",
         url,
     ):
         if len(m.groups()) not in [2, 3]:
             raise ValueError(
-                "Invalid HuggingFace URL. Expected format: huggingface.co/<owner>/<model-name>[/<lora-weights-file.safetensors>]"
+                "Invalid HuggingFace URL. Expected format: huggingface.co/<owner>/<model-name>[/<file-path.safetensors>]"
+            )
+        # 如果有文件路径，确保以 .safetensors 结尾
+        if len(m.groups()) == 3 and m.groups()[2] and not m.groups()[2].endswith('.safetensors'):
+            raise ValueError(
+                f"HuggingFace URL must point to a .safetensors file. Got: {m.groups()[2]}"
             )
         return url
     if m := re.match(r"^(?:https?://)?civitai\.com/models/(\d+)(?:/[^/?]+)?/?$", url):
@@ -296,7 +316,7 @@ def make_download_url(url: str, civitai_api_token: Secret | None = None) -> str:
 
     if "huggingface.co" in url:
         raise ValueError(
-            "Failed to parse HuggingFace URL. Expected huggingface.co/<owner>/<model-name>[/<lora-weights-file.safetensors>]"
+            "Failed to parse HuggingFace URL. Expected huggingface.co/<owner>/<model-name>[/<file-path.safetensors>]"
         )
     if "civitai.com" in url:
         raise ValueError(
@@ -305,7 +325,7 @@ def make_download_url(url: str, civitai_api_token: Secret | None = None) -> str:
     raise ValueError(
         """Failed to parse URL. Expected either:
 * Replicate model in the format <owner>/<username> or <owner>/<username>/<version>
-* HuggingFace URL in the format huggingface.co/<owner>/<model-name>[/<lora-weights-file.safetensors>]
+* HuggingFace URL in the format huggingface.co/<owner>/<model-name>[/<file-path.safetensors>]
 * CivitAI URL in the format civitai.com/models/<id>[/<model-name>]
 * Arbitrary .safetensors URLs from the Internet"""
     )
